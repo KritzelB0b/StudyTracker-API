@@ -152,6 +152,21 @@ def public_view():
     if not isinstance(study,dict):study={}
     r={'fields':sorted(fields),'readonly':True}
     allowed_ids={m.get('id') for m in mods if isinstance(m,dict)}
+    # Semester workload is stored in study.modules, not in the editable module list.
+    # Publish only the numeric handbook totals and public module labels.
+    if 'cockpit' in fields or 'calendar' in fields:
+        handbook = study.get('modules', []) or []
+        if not isinstance(handbook, list):
+            handbook = []
+        r['workload'] = [
+            {'moduleId': str(x.get('localId') or '')[:60],
+             'name': str(x.get('name') or 'Modul')[:120],
+             'ects': x.get('ects') if isinstance(x.get('ects'), (int, float)) else None,
+             'total': x.get('total') if isinstance(x.get('total'), (int, float)) else None,
+             'presence': x.get('presence') if isinstance(x.get('presence'), (int, float)) else None,
+             'self': x.get('self') if isinstance(x.get('self'), (int, float)) else None}
+            for x in handbook[:100] if isinstance(x, dict)
+        ]
     if 'modules' in fields:
         r['modules']=[{'id':str(m.get('id',''))[:60], 'name':str(m.get('name','Modul'))[:120],
                         'ects':m.get('ects') if isinstance(m.get('ects'),(int,float)) else None,
