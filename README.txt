@@ -1,0 +1,1 @@
+StudyTracker 2.3: 1) Railway API: main.py ersetzen, deployen. 2) Railway Variable PUBLIC_DASHBOARD_ENABLED=true setzen (erst nach bewusster Freigabe). 3) GitHub Pages: index.html, editor.html, manifest.webmanifest, sw.js, icon.svg hochladen. 4) Export-Backup vor Update. Öffentliche Startseite zeigt nur aggregierte Lernstunden. Editor unter /editor.html. Keine Login-Umgehung.

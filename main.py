@@ -99,3 +99,34 @@ def push(payload: SyncPayload, user_id: int = Depends(auth)):
         if not row:
             raise HTTPException(409, 'Datenkonflikt: Bitte neuesten Stand laden und Änderungen zusammenführen')
     return {'revision':row[0]}
+
+
+# Public, read-only statistics. Never expose raw records, notes, Moodle links,
+# task titles, email addresses, authentication tokens, or individual timestamps.
+@app.get('/public/stats')
+def public_stats():
+    if os.environ.get('PUBLIC_DASHBOARD_ENABLED', 'false').lower() != 'true':
+        raise HTTPException(404, 'Öffentliches Dashboard ist deaktiviert')
+    with connect() as conn:
+        row = conn.execute('''SELECT d.data, d.updated_at FROM user_data d
+                              JOIN users u ON u.id=d.user_id
+                              WHERE u.email=%s LIMIT 1''', (OWNER_EMAIL,)).fetchone()
+    if not row:
+        return {'modules': [], 'total_hours': 0, 'session_count': 0, 'last_updated': None}
+    data, updated_at = row
+    modules = data.get('modules', []) if isinstance(data, dict) else []
+    entries = data.get('entries', []) if isinstance(data, dict) else []
+    summary = []
+    for mod in modules[:100]:
+        if not isinstance(mod, dict):
+            continue
+        mid = mod.get('id')
+        mins = sum(max(0, min(int(e.get('minutes', 0)), 1440))
+                   for e in entries if isinstance(e, dict) and e.get('moduleId') == mid
+                   and isinstance(e.get('minutes'), (int, float)))
+        summary.append({'name': str(mod.get('name', 'Modul'))[:120],
+                        'hours': round(mins / 60, 1),
+                        'sessions': sum(1 for e in entries if isinstance(e, dict) and e.get('moduleId') == mid)})
+    summary.sort(key=lambda x:x['hours'],reverse=True)
+    return {'modules':summary, 'total_hours':round(sum(m['hours'] for m in summary),1),
+            'session_count':len(entries), 'last_updated':updated_at.isoformat()}
