@@ -101,32 +101,91 @@ def push(payload: SyncPayload, user_id: int = Depends(auth)):
     return {'revision':row[0]}
 
 
-# Public, read-only statistics. Never expose raw records, notes, Moodle links,
-# task titles, email addresses, authentication tokens, or individual timestamps.
-@app.get('/public/stats')
-def public_stats():
-    if os.environ.get('PUBLIC_DASHBOARD_ENABLED', 'false').lower() != 'true':
-        raise HTTPException(404, 'Öffentliches Dashboard ist deaktiviert')
+
+# Version 2.5: strict server-side projection; never return full records to visitors.
+from datetime import date
+PUBLIC_FIELDS = {'dashboard','modules','calendar','tasks','exams','cockpit'}
+class PrivacySettings(BaseModel):
+    enabled: bool = False
+    fields: list[str] = Field(default_factory=list)
+
+@app.on_event('startup')
+def init_privacy():
     with connect() as conn:
-        row = conn.execute('''SELECT d.data, d.updated_at FROM user_data d
-                              JOIN users u ON u.id=d.user_id
-                              WHERE u.email=%s LIMIT 1''', (OWNER_EMAIL,)).fetchone()
-    if not row:
-        return {'modules': [], 'total_hours': 0, 'session_count': 0, 'last_updated': None}
-    data, updated_at = row
-    modules = data.get('modules', []) if isinstance(data, dict) else []
-    entries = data.get('entries', []) if isinstance(data, dict) else []
-    summary = []
-    for mod in modules[:100]:
-        if not isinstance(mod, dict):
-            continue
-        mid = mod.get('id')
-        mins = sum(max(0, min(int(e.get('minutes', 0)), 1440))
-                   for e in entries if isinstance(e, dict) and e.get('moduleId') == mid
-                   and isinstance(e.get('minutes'), (int, float)))
-        summary.append({'name': str(mod.get('name', 'Modul'))[:120],
-                        'hours': round(mins / 60, 1),
-                        'sessions': sum(1 for e in entries if isinstance(e, dict) and e.get('moduleId') == mid)})
-    summary.sort(key=lambda x:x['hours'],reverse=True)
-    return {'modules':summary, 'total_hours':round(sum(m['hours'] for m in summary),1),
-            'session_count':len(entries), 'last_updated':updated_at.isoformat()}
+        conn.execute("CREATE TABLE IF NOT EXISTS public_preferences (user_id BIGINT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE, settings JSONB NOT NULL DEFAULT '{}'::jsonb)")
+
+@app.get('/privacy')
+def get_privacy(user_id: int = Depends(auth)):
+    with connect() as conn:
+        row=conn.execute('SELECT settings FROM public_preferences WHERE user_id=%s',(user_id,)).fetchone()
+    data=row[0] if row else {}
+    return {'enabled':bool(data.get('enabled',False)),'fields':sorted(set(data.get('fields',[])) & PUBLIC_FIELDS)}
+
+@app.put('/privacy')
+def put_privacy(prefs:PrivacySettings,user_id:int=Depends(auth)):
+    fields=sorted(set(prefs.fields) & PUBLIC_FIELDS)
+    with connect() as conn:
+        conn.execute('INSERT INTO public_preferences(user_id,settings) VALUES(%s,%s) ON CONFLICT (user_id) DO UPDATE SET settings=EXCLUDED.settings',(user_id,Jsonb({'enabled':prefs.enabled,'fields':fields})))
+    return {'enabled':prefs.enabled,'fields':fields}
+
+def clean_date(v):
+    s=str(v or '')[:10]
+    try:date.fromisoformat(s);return s
+    except (ValueError,TypeError):return None
+
+def safe_minutes(v):
+    return float(v) if isinstance(v,(int,float)) and 0<=v<=1440 else 0
+
+@app.get('/public/view')
+def public_view():
+    with connect() as conn:
+        row=conn.execute("""SELECT d.data,p.settings FROM user_data d JOIN users u ON d.user_id=u.id
+        LEFT JOIN public_preferences p ON p.user_id=u.id WHERE u.email=%s LIMIT 1""",(OWNER_EMAIL,)).fetchone()
+    if not row or not isinstance(row[1],dict) or not row[1].get('enabled'):
+        raise HTTPException(404,'Öffentliche Freigabe deaktiviert')
+    raw,prefs=row
+    fields=set(prefs.get('fields',[])) & PUBLIC_FIELDS
+    mods=raw.get('modules',[]) if isinstance(raw,dict) else []
+    topics=raw.get('topics',[]) if isinstance(raw,dict) else []
+    entries=raw.get('entries',[]) if isinstance(raw,dict) else []
+    study=raw.get('study',{}) if isinstance(raw,dict) else {}
+    if not isinstance(study,dict):study={}
+    r={'fields':sorted(fields),'readonly':True}
+    allowed_ids={m.get('id') for m in mods if isinstance(m,dict)}
+    if 'modules' in fields:
+        r['modules']=[{'id':str(m.get('id',''))[:60], 'name':str(m.get('name','Modul'))[:120],
+                        'ects':m.get('ects') if isinstance(m.get('ects'),(int,float)) else None,
+                        'self':m.get('self') if isinstance(m.get('self'),(int,float)) else None}
+                      for m in mods[:100] if isinstance(m,dict)]
+        r['topics']=[{'moduleId':str(t.get('moduleId',''))[:60], 'name':str(t.get('name',''))[:120],
+                      'parentId':str(t.get('parentId',''))[:60], 'mastery':max(0,min(5,int(t.get('mastery') or 0)))}
+                     for t in topics[:1500] if isinstance(t,dict) and t.get('moduleId') in allowed_ids]
+    if 'dashboard' in fields or 'cockpit' in fields:
+        usable=[e for e in entries if isinstance(e,dict)]
+        total=sum(safe_minutes(e.get('minutes')) for e in usable)
+        r['summary']={'hours':round(total/60,1),'sessions':len(usable)}
+        r['by_module']=[{'moduleId':str(m.get('id',''))[:60],'name':str(m.get('name','Modul'))[:120],
+                         'hours':round(sum(safe_minutes(e.get('minutes')) for e in usable if e.get('moduleId')==m.get('id'))/60,1)}
+                       for m in mods if isinstance(m,dict)][:100]
+        r['by_day']=[{'date':d,'hours':round(sum(safe_minutes(e.get('minutes')) for e in usable if e.get('date')==d)/60,1)}
+                     for d in sorted(set(e.get('date') for e in usable if clean_date(e.get('date'))))][-120:]
+    if 'calendar' in fields:
+        events=study.get('events',[]) or []
+        r['events']=[{'date':clean_date(e.get('date')),'start':str(e.get('start',''))[:5],
+                      'end':str(e.get('end',''))[:5],'title':str(e.get('name','Veranstaltung'))[:130],
+                      'kind':str(e.get('type','Vorlesung'))[:35]}
+                     for e in events[:3000] if isinstance(e,dict) and clean_date(e.get('date'))]
+    all_tasks=[t for t in (study.get('tasks',[]) or []) if isinstance(t,dict)]
+    if 'tasks' in fields:
+        r['tasks']=[{'title':str(t.get('title','Aufgabe'))[:130], 'date':clean_date(t.get('date')),
+                     'done':bool(t.get('done',False)), 'moduleId':str(t.get('moduleId',''))[:60]}
+                    for t in all_tasks[:1000] if t.get('kind','task')=='task' and clean_date(t.get('date'))]
+    if 'exams' in fields:
+        r['exams']=[{'title':str(e.get('title','Prüfung'))[:130], 'date':clean_date(e.get('date')),
+                     'moduleId':str(e.get('moduleId',''))[:60]}
+                    for e in all_tasks[:1000] if e.get('kind')=='exam' and clean_date(e.get('date'))]
+    if 'calendar' in fields:
+        # Only expose scheduled study blocks when the calendar itself is approved.
+        r['study_blocks']=[{'title':str(t.get('title','Lernblock'))[:130], 'date':clean_date(t.get('date'))}
+                          for t in all_tasks[:1000] if t.get('kind')=='study' and clean_date(t.get('date'))]
+    return r
