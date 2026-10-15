@@ -189,3 +189,5 @@ def public_view():
         r['study_blocks']=[{'title':str(t.get('title','Lernblock'))[:130], 'date':clean_date(t.get('date'))}
                           for t in all_tasks[:1000] if t.get('kind')=='study' and clean_date(t.get('date'))]
     return r
+
+# Trigger Railway deployment for StudyTracker 2.5
