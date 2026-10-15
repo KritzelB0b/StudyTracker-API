@@ -90,7 +90,7 @@ def pull(user_id: int = Depends(auth)):
 @app.put('/sync')
 def push(payload: SyncPayload, user_id: int = Depends(auth)):
     d = payload.data
-    if set(d.keys()) != {'modules','topics','entries'} or any(not isinstance(d[k],list) for k in ['modules','topics','entries']):
+    if not {'modules','topics','entries'}.issubset(d.keys()) or set(d.keys()) - {'modules','topics','entries','study'} or any(not isinstance(d[k],list) for k in ['modules','topics','entries']) or (d.get('study') is not None and not isinstance(d['study'],dict)):
         raise HTTPException(422, 'Ungültiges Datenformat')
     if len(str(d)) > 1_500_000:
         raise HTTPException(413, 'Datensatz zu groß')
