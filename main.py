@@ -214,9 +214,10 @@ from fastapi.responses import StreamingResponse
 from pydantic import field_validator
 import io
 import re
-from uuid import uuid4
+from uuid import uuid4, UUID
 
 MAX_PRIVATE_FILE = 20 * 1024 * 1024
+MAX_PRIVATE_TOTAL = 250 * 1024 * 1024
 ALLOWED_EXTENSIONS = {'.pdf','.txt','.csv','.png','.jpg','.jpeg','.webp','.xlsx','.xls','.docx','.pptx','.step','.stp','.stl'}
 class FolderInput(BaseModel):
     name: str = Field(min_length=1, max_length=120)
@@ -246,10 +247,16 @@ def init_private_documents():
         conn.execute('CREATE INDEX IF NOT EXISTS private_folders_owner_idx ON private_folders(user_id,parent_id)')
         conn.execute('CREATE INDEX IF NOT EXISTS private_documents_owner_idx ON private_documents(user_id,folder_id)')
 
+def checked_uuid(value: str | None):
+    if value is None: return None
+    try: return str(UUID(value))
+    except (ValueError, AttributeError, TypeError):
+        raise HTTPException(422, 'Ungültige Kennung')
+
 def folder_exists(conn, owner, id):
-    if not id: return True
-    try: return bool(conn.execute('SELECT 1 FROM private_folders WHERE id=%s AND user_id=%s',(id,owner)).fetchone())
-    except psycopg.errors.InvalidTextRepresentation: return False
+    id = checked_uuid(id)
+    if id is None: return True
+    return bool(conn.execute('SELECT 1 FROM private_folders WHERE id=%s AND user_id=%s',(id,owner)).fetchone())
 
 def valid_filename(name):
     name=name.strip()
@@ -269,14 +276,16 @@ def list_private_folders(user_id:int=Depends(auth)):
 def create_private_folder(payload:FolderInput,user_id:int=Depends(auth)):
     name=payload.name.strip()
     if not name or '/' in name or '\\' in name: raise HTTPException(422,'Ungültiger Ordnername')
+    parent_id=checked_uuid(payload.parent_id)
     with connect() as conn:
-        if not folder_exists(conn,user_id,payload.parent_id): raise HTTPException(404,'Überordner nicht gefunden')
+        if not folder_exists(conn,user_id,parent_id): raise HTTPException(404,'Überordner nicht gefunden')
         new_id=str(uuid4())
-        conn.execute('INSERT INTO private_folders(id,user_id,parent_id,name) VALUES(%s,%s,%s,%s)',(new_id,user_id,payload.parent_id,name))
-    return {'id':new_id,'name':name,'parent_id':payload.parent_id}
+        conn.execute('INSERT INTO private_folders(id,user_id,parent_id,name) VALUES(%s,%s,%s,%s)',(new_id,user_id,parent_id,name))
+    return {'id':new_id,'name':name,'parent_id':parent_id}
 
 @app.delete('/private/folders/{folder_id}')
 def delete_private_folder(folder_id:str,user_id:int=Depends(auth)):
+    folder_id=checked_uuid(folder_id)
     with connect() as conn:
         row=conn.execute('SELECT 1 FROM private_folders WHERE id=%s AND user_id=%s',(folder_id,user_id)).fetchone()
         if not row: raise HTTPException(404,'Ordner nicht gefunden')
@@ -288,6 +297,7 @@ def delete_private_folder(folder_id:str,user_id:int=Depends(auth)):
 @app.get('/private/documents')
 def list_private_documents(folder_id:str|None=None,user_id:int=Depends(auth)):
     with connect() as conn:
+        folder_id=checked_uuid(folder_id)
         if not folder_exists(conn,user_id,folder_id):raise HTTPException(404,'Ordner nicht gefunden')
         rows=conn.execute('SELECT id,folder_id,filename,mime,size_bytes,created_at FROM private_documents WHERE user_id=%s AND folder_id IS NOT DISTINCT FROM %s::uuid ORDER BY filename',(user_id,folder_id)).fetchall()
     return [{'id':str(i),'folder_id':str(f) if f else None,'filename':n,'mime':m,'size':size,'created_at':created.isoformat()} for i,f,n,m,size,created in rows]
@@ -295,6 +305,9 @@ def list_private_documents(folder_id:str|None=None,user_id:int=Depends(auth)):
 @app.post('/private/documents')
 async def upload_private_document(request:Request,filename:str,folder_id:str|None=None,user_id:int=Depends(auth)):
     filename,ext=valid_filename(filename)
+    folder_id=checked_uuid(folder_id)
+    if request.headers.get('content-length') and int(request.headers['content-length'])>MAX_PRIVATE_FILE:
+        raise HTTPException(413,'Datei zu groß (maximal 20 MB)')
     with connect() as conn:
         if not folder_exists(conn,user_id,folder_id):raise HTTPException(404,'Ordner nicht gefunden')
     payload=bytearray()
@@ -306,11 +319,15 @@ async def upload_private_document(request:Request,filename:str,folder_id:str|Non
     doc_id=str(uuid4())
     mime='application/pdf' if ext=='.pdf' else 'application/octet-stream'
     with connect() as conn:
+        conn.execute('SELECT pg_advisory_xact_lock(%s)',(user_id,))
+        current_bytes=conn.execute('SELECT COALESCE(SUM(size_bytes),0) FROM private_documents WHERE user_id=%s',(user_id,)).fetchone()[0]
+        if current_bytes+len(payload)>MAX_PRIVATE_TOTAL:raise HTTPException(413,'Privater Speicher voll (250 MB)')
         conn.execute('INSERT INTO private_documents(id,user_id,folder_id,filename,mime,bytes,size_bytes) VALUES(%s,%s,%s,%s,%s,%s,%s)',(doc_id,user_id,folder_id,filename,mime,bytes(payload),len(payload)))
     return {'id':doc_id,'filename':filename,'size':len(payload),'folder_id':folder_id}
 
 @app.get('/private/documents/{doc_id}')
 def download_private_document(doc_id:str,user_id:int=Depends(auth)):
+    doc_id=checked_uuid(doc_id)
     with connect() as conn:
         row=conn.execute('SELECT filename,mime,bytes FROM private_documents WHERE id=%s AND user_id=%s',(doc_id,user_id)).fetchone()
     if not row:raise HTTPException(404,'Datei nicht gefunden')
@@ -321,6 +338,7 @@ def download_private_document(doc_id:str,user_id:int=Depends(auth)):
 
 @app.delete('/private/documents/{doc_id}')
 def delete_private_document(doc_id:str,user_id:int=Depends(auth)):
+    doc_id=checked_uuid(doc_id)
     with connect() as conn:
         row=conn.execute('DELETE FROM private_documents WHERE id=%s AND user_id=%s RETURNING id',(doc_id,user_id)).fetchone()
     if not row:raise HTTPException(404,'Datei nicht gefunden')
@@ -328,6 +346,7 @@ def delete_private_document(doc_id:str,user_id:int=Depends(auth)):
 
 @app.get('/private/documents/{doc_id}/notes')
 def private_document_notes(doc_id:str,user_id:int=Depends(auth)):
+    doc_id=checked_uuid(doc_id)
     with connect() as conn:
         found=conn.execute('SELECT 1 FROM private_documents WHERE id=%s AND user_id=%s',(doc_id,user_id)).fetchone()
         if not found:raise HTTPException(404,'Datei nicht gefunden')
@@ -336,6 +355,7 @@ def private_document_notes(doc_id:str,user_id:int=Depends(auth)):
 
 @app.put('/private/documents/{doc_id}/notes')
 def save_private_document_notes(doc_id:str,payload:AnnotationInput,user_id:int=Depends(auth)):
+    doc_id=checked_uuid(doc_id)
     if len(str(payload.data))>250_000:raise HTTPException(413,'Anmerkungen zu umfangreich')
     with connect() as conn:
         found=conn.execute('SELECT 1 FROM private_documents WHERE id=%s AND user_id=%s',(doc_id,user_id)).fetchone()
