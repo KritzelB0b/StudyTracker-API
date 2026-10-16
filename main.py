@@ -372,3 +372,63 @@ def save_private_document_notes(doc_id:str,payload:AnnotationInput,user_id:int=D
         else:
             conn.execute('INSERT INTO private_document_notes(user_id,document_id,data,revision) VALUES(%s,%s,%s,1)',(user_id,doc_id,Jsonb(payload.data)))
     return {'saved':True,'revision':actual+1}
+
+
+class FolderChange(BaseModel):
+    name: str | None = None
+    parent_id: str | None = None
+
+class DocumentChange(BaseModel):
+    filename: str | None = None
+    folder_id: str | None = None
+
+def valid_folder_name(value):
+    name=value.strip()
+    if not name or len(name)>120 or '/' in name or '\\' in name or any(ord(c)<32 for c in name):
+        raise HTTPException(422,'Ungültiger Ordnername')
+    return name
+
+@app.put('/private/folders/{folder_id}')
+def rename_or_move_folder(folder_id:str, payload:FolderChange,user_id:int=Depends(auth)):
+    folder_id=checked_uuid(folder_id)
+    updates=payload.model_fields_set
+    if not updates or updates-{'name','parent_id'}:raise HTTPException(422,'Keine Änderungen')
+    with connect() as conn:
+        row=conn.execute('SELECT name,parent_id FROM private_folders WHERE id=%s AND user_id=%s',(folder_id,user_id)).fetchone()
+        if not row:raise HTTPException(404,'Ordner nicht gefunden')
+        name=valid_folder_name(payload.name) if 'name' in updates and payload.name is not None else row[0]
+        parent=checked_uuid(payload.parent_id) if 'parent_id' in updates else (str(row[1]) if row[1] else None)
+        if not folder_exists(conn,user_id,parent):raise HTTPException(404,'Zielordner nicht gefunden')
+        if parent==folder_id:raise HTTPException(409,'Ein Ordner kann nicht in sich selbst verschoben werden')
+        cursor=parent
+        while cursor is not None:
+            found=conn.execute('SELECT parent_id FROM private_folders WHERE id=%s AND user_id=%s',(cursor,user_id)).fetchone()
+            if not found:raise HTTPException(404,'Zielordner nicht gefunden')
+            cursor=str(found[0]) if found[0] else None
+            if cursor==folder_id:raise HTTPException(409,'Ein Ordner kann nicht in einen Unterordner verschoben werden')
+        conn.execute('UPDATE private_folders SET name=%s,parent_id=%s WHERE id=%s AND user_id=%s',(name,parent,folder_id,user_id))
+    return {'id':folder_id,'name':name,'parent_id':parent}
+
+@app.put('/private/documents/{doc_id}')
+def rename_or_move_document(doc_id:str,payload:DocumentChange,user_id:int=Depends(auth)):
+    doc_id=checked_uuid(doc_id)
+    updates=payload.model_fields_set
+    if not updates or updates-{'filename','folder_id'}:raise HTTPException(422,'Keine Änderungen')
+    with connect() as conn:
+        row=conn.execute('SELECT filename,folder_id FROM private_documents WHERE id=%s AND user_id=%s',(doc_id,user_id)).fetchone()
+        if not row:raise HTTPException(404,'Datei nicht gefunden')
+        name=valid_filename(payload.filename)[0] if 'filename' in updates and payload.filename is not None else row[0]
+        # Forbid changing file type by renaming: it would undermine type checks.
+        if os.path.splitext(name)[1].lower()!=os.path.splitext(row[0])[1].lower():
+            raise HTTPException(422,'Dateiendung darf nicht geändert werden')
+        parent=checked_uuid(payload.folder_id) if 'folder_id' in updates else (str(row[1]) if row[1] else None)
+        if not folder_exists(conn,user_id,parent):raise HTTPException(404,'Zielordner nicht gefunden')
+        conn.execute('UPDATE private_documents SET filename=%s,folder_id=%s WHERE id=%s AND user_id=%s',(name,parent,doc_id,user_id))
+    return {'id':doc_id,'filename':name,'folder_id':parent}
+
+@app.get('/private/storage')
+def private_storage(user_id:int=Depends(auth)):
+    with connect() as conn:
+        used,count=conn.execute('SELECT COALESCE(SUM(size_bytes),0),COUNT(*) FROM private_documents WHERE user_id=%s',(user_id,)).fetchone()
+        directories=conn.execute('SELECT COUNT(*) FROM private_folders WHERE user_id=%s',(user_id,)).fetchone()[0]
+    return {'used_bytes':int(used),'quota_bytes':MAX_PRIVATE_TOTAL,'file_count':count,'folder_count':directories}
