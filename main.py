@@ -216,8 +216,27 @@ import io
 import re
 from uuid import uuid4, UUID
 
-MAX_PRIVATE_FILE = 20 * 1024 * 1024
-MAX_PRIVATE_TOTAL = 250 * 1024 * 1024
+# Files above the legacy PostgreSQL limit are streamed into the private object bucket.
+# Existing BYTEA files remain readable and are not migrated automatically.
+from tempfile import SpooledTemporaryFile
+from starlette.concurrency import run_in_threadpool
+from botocore.config import Config
+import boto3
+
+MAX_PRIVATE_FILE = int(os.getenv('MAX_PRIVATE_FILE_MB','125')) * 1024 * 1024
+MAX_PRIVATE_TOTAL = int(os.getenv('MAX_PRIVATE_TOTAL_MB','1024')) * 1024 * 1024
+S3_ENDPOINT = os.environ.get('STORAGE_ENDPOINT','')
+S3_BUCKET = os.environ.get('STORAGE_BUCKET','')
+S3_REGION = os.environ.get('STORAGE_REGION','auto')
+S3_ACCESS_KEY = os.environ.get('STORAGE_ACCESS_KEY_ID','')
+S3_SECRET_KEY = os.environ.get('STORAGE_SECRET_ACCESS_KEY','')
+def bucket_client():
+    if not all([S3_ENDPOINT,S3_BUCKET,S3_ACCESS_KEY,S3_SECRET_KEY]):
+        raise HTTPException(503,'Dateispeicher vorübergehend nicht konfiguriert')
+    return boto3.client('s3',endpoint_url=S3_ENDPOINT,region_name=S3_REGION,
+        aws_access_key_id=S3_ACCESS_KEY,aws_secret_access_key=S3_SECRET_KEY,
+        config=Config(signature_version='s3v4',s3={'addressing_style':'virtual'},retries={'max_attempts':3}))
+
 ALLOWED_EXTENSIONS = {'.pdf','.txt','.csv','.png','.jpg','.jpeg','.webp','.xlsx','.xls','.docx','.pptx','.step','.stp','.stl'}
 class FolderInput(BaseModel):
     name: str = Field(min_length=1, max_length=120)
@@ -248,6 +267,7 @@ def init_private_documents():
         conn.execute('CREATE INDEX IF NOT EXISTS private_folders_owner_idx ON private_folders(user_id,parent_id)')
         conn.execute('CREATE INDEX IF NOT EXISTS private_documents_owner_idx ON private_documents(user_id,folder_id)')
         conn.execute('ALTER TABLE private_document_notes ADD COLUMN IF NOT EXISTS revision BIGINT NOT NULL DEFAULT 0')
+        conn.execute('ALTER TABLE private_documents ADD COLUMN IF NOT EXISTS storage_key TEXT')
 
 def checked_uuid(value: str | None):
     if value is None: return None
@@ -309,41 +329,80 @@ async def upload_private_document(request:Request,filename:str,folder_id:str|Non
     filename,ext=valid_filename(filename)
     folder_id=checked_uuid(folder_id)
     if request.headers.get('content-length') and int(request.headers['content-length'])>MAX_PRIVATE_FILE:
-        raise HTTPException(413,'Datei zu groß (maximal 20 MB)')
+        raise HTTPException(413,'Datei zu groß (Limit: '+str(MAX_PRIVATE_FILE//1048576)+' MB)')
     with connect() as conn:
         if not folder_exists(conn,user_id,folder_id):raise HTTPException(404,'Ordner nicht gefunden')
-    payload=bytearray()
-    async for chunk in request.stream():
-        payload.extend(chunk)
-        if len(payload)>MAX_PRIVATE_FILE:raise HTTPException(413,'Datei zu groß (maximal 20 MB)')
-    if not payload:raise HTTPException(422,'Datei leer')
-    if ext=='.pdf' and not payload[:1024].lstrip().startswith(b'%PDF-'): raise HTTPException(415,'Ungültiges PDF')
-    doc_id=str(uuid4())
-    mime='application/pdf' if ext=='.pdf' else 'application/octet-stream'
-    with connect() as conn:
-        conn.execute('SELECT pg_advisory_xact_lock(%s)',(user_id,))
-        current_bytes=conn.execute('SELECT COALESCE(SUM(size_bytes),0) FROM private_documents WHERE user_id=%s',(user_id,)).fetchone()[0]
-        if current_bytes+len(payload)>MAX_PRIVATE_TOTAL:raise HTTPException(413,'Privater Speicher voll (250 MB)')
-        conn.execute('INSERT INTO private_documents(id,user_id,folder_id,filename,mime,bytes,size_bytes) VALUES(%s,%s,%s,%s,%s,%s,%s)',(doc_id,user_id,folder_id,filename,mime,bytes(payload),len(payload)))
-    return {'id':doc_id,'filename':filename,'size':len(payload),'folder_id':folder_id}
+    temp=SpooledTemporaryFile(max_size=4*1024*1024)
+    size=0
+    try:
+        async for chunk in request.stream():
+            size+=len(chunk)
+            if size>MAX_PRIVATE_FILE:raise HTTPException(413,'Datei zu groß (Limit: '+str(MAX_PRIVATE_FILE//1048576)+' MB)')
+            temp.write(chunk)
+        if not size:raise HTTPException(422,'Datei leer')
+        if ext=='.pdf':
+            temp.seek(0)
+            if not temp.read(1024).lstrip().startswith(b'%PDF-'):raise HTTPException(415,'Ungültiges PDF')
+        temp.seek(0)
+        doc_id=str(uuid4())
+        key='owners/'+str(user_id)+'/documents/'+doc_id
+        mime='application/pdf' if ext=='.pdf' else 'application/octet-stream'
+        client=bucket_client()
+        try:
+            await run_in_threadpool(client.upload_fileobj,temp,S3_BUCKET,key,
+                ExtraArgs={'ContentType':mime},Config=boto3.s3.transfer.TransferConfig(
+                    multipart_threshold=8*1024*1024,multipart_chunksize=8*1024*1024,
+                    max_concurrency=2))
+        except Exception:
+            raise HTTPException(502,'Cloud-Upload fehlgeschlagen. Bitte erneut versuchen.')
+        try:
+            with connect() as conn:
+                conn.execute('SELECT pg_advisory_xact_lock(%s)',(user_id,))
+                current_bytes=conn.execute('SELECT COALESCE(SUM(size_bytes),0) FROM private_documents WHERE user_id=%s',(user_id,)).fetchone()[0]
+                if current_bytes+size>MAX_PRIVATE_TOTAL:
+                    raise HTTPException(413,'Speicherplatz voll (Limit: '+str(MAX_PRIVATE_TOTAL//1048576)+' MB)')
+                conn.execute('INSERT INTO private_documents(id,user_id,folder_id,filename,mime,bytes,size_bytes,storage_key) VALUES(%s,%s,%s,%s,%s,%s,%s,%s)',(doc_id,user_id,folder_id,filename,mime,b'',size,key))
+        except Exception:
+            await run_in_threadpool(client.delete_object,Bucket=S3_BUCKET,Key=key)
+            raise
+        return {'id':doc_id,'filename':filename,'size':size,'folder_id':folder_id}
+    finally:
+        temp.close()
 
 @app.get('/private/documents/{doc_id}')
 def download_private_document(doc_id:str,user_id:int=Depends(auth)):
     doc_id=checked_uuid(doc_id)
     with connect() as conn:
-        row=conn.execute('SELECT filename,mime,bytes FROM private_documents WHERE id=%s AND user_id=%s',(doc_id,user_id)).fetchone()
+        row=conn.execute('SELECT filename,mime,bytes,size_bytes,storage_key FROM private_documents WHERE id=%s AND user_id=%s',(doc_id,user_id)).fetchone()
     if not row:raise HTTPException(404,'Datei nicht gefunden')
-    name,mime,data=row
-    # Avoid inline execution of HTML, SVG and other untrusted content.
+    name,mime,data,size,key=row
     from urllib.parse import quote
-    return Response(content=bytes(data),media_type=mime,headers={'Content-Disposition':"attachment; filename*=UTF-8''"+quote(name),'X-Content-Type-Options':'nosniff','Cache-Control':'no-store'})
+    headers={'Content-Disposition':"attachment; filename*=UTF-8''"+quote(name),
+        'X-Content-Type-Options':'nosniff','Cache-Control':'no-store',
+        'Content-Length':str(size),'Accept-Ranges':'none'}
+    if not key:
+        return Response(content=bytes(data),media_type=mime,headers=headers)
+    try:
+        response=bucket_client().get_object(Bucket=S3_BUCKET,Key=key)
+    except Exception:
+        raise HTTPException(502,'Datei ist vorübergehend nicht aus dem privaten Speicher abrufbar')
+    stream=response['Body']
+    def chunks():
+        try:
+            for chunk in stream.iter_chunks(chunk_size=1024*1024):
+                if chunk:yield chunk
+        finally:stream.close()
+    return StreamingResponse(chunks(),media_type=mime,headers=headers)
 
 @app.delete('/private/documents/{doc_id}')
 def delete_private_document(doc_id:str,user_id:int=Depends(auth)):
     doc_id=checked_uuid(doc_id)
     with connect() as conn:
-        row=conn.execute('DELETE FROM private_documents WHERE id=%s AND user_id=%s RETURNING id',(doc_id,user_id)).fetchone()
-    if not row:raise HTTPException(404,'Datei nicht gefunden')
+        row=conn.execute('DELETE FROM private_documents WHERE id=%s AND user_id=%s RETURNING storage_key',(doc_id,user_id)).fetchone()
+        if not row:raise HTTPException(404,'Datei nicht gefunden')
+    if row[0]:
+        try:bucket_client().delete_object(Bucket=S3_BUCKET,Key=row[0])
+        except Exception:pass  # The owner has lost access in the DB; storage garbage collection can be retried.
     return {'deleted':True}
 
 @app.get('/private/documents/{doc_id}/notes')
