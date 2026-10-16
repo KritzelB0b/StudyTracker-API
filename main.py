@@ -362,6 +362,7 @@ def save_private_document_notes(doc_id:str,payload:AnnotationInput,user_id:int=D
     with connect() as conn:
         found=conn.execute('SELECT 1 FROM private_documents WHERE id=%s AND user_id=%s',(doc_id,user_id)).fetchone()
         if not found:raise HTTPException(404,'Datei nicht gefunden')
+        conn.execute('SELECT pg_advisory_xact_lock(hashtextextended(%s,0))',(doc_id,))
         row=conn.execute('SELECT revision FROM private_document_notes WHERE user_id=%s AND document_id=%s FOR UPDATE',(user_id,doc_id)).fetchone()
         actual=row[0] if row else 0
         if actual!=payload.revision:
