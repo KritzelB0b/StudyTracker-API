@@ -221,6 +221,7 @@ from uuid import uuid4, UUID
 from tempfile import SpooledTemporaryFile
 from starlette.concurrency import run_in_threadpool
 from botocore.config import Config
+from boto3.s3.transfer import TransferConfig
 import boto3
 
 MAX_PRIVATE_FILE = int(os.getenv('MAX_PRIVATE_FILE_MB','125')) * 1024 * 1024
@@ -350,7 +351,7 @@ async def upload_private_document(request:Request,filename:str,folder_id:str|Non
         client=bucket_client()
         try:
             await run_in_threadpool(client.upload_fileobj,temp,S3_BUCKET,key,
-                ExtraArgs={'ContentType':mime},Config=boto3.s3.transfer.TransferConfig(
+                ExtraArgs={'ContentType':mime},Config=TransferConfig(
                     multipart_threshold=8*1024*1024,multipart_chunksize=8*1024*1024,
                     max_concurrency=2))
         except Exception:
