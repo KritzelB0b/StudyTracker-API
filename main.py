@@ -225,7 +225,7 @@ class FolderInput(BaseModel):
 
 class AnnotationInput(BaseModel):
     data: dict[str, Any]
-    revision: int = Field(ge=0)
+    revision: int | None = Field(default=None, ge=0)
 
 @app.on_event('startup')
 def init_private_documents():
@@ -365,7 +365,7 @@ def save_private_document_notes(doc_id:str,payload:AnnotationInput,user_id:int=D
         conn.execute('SELECT pg_advisory_xact_lock(hashtextextended(%s,0))',(doc_id,))
         row=conn.execute('SELECT revision FROM private_document_notes WHERE user_id=%s AND document_id=%s FOR UPDATE',(user_id,doc_id)).fetchone()
         actual=row[0] if row else 0
-        if actual!=payload.revision:
+        if payload.revision is not None and actual!=payload.revision:
             raise HTTPException(409,'Neuere Anmerkungen vorhanden: Bitte Dokument erneut laden')
         if row:
             conn.execute('UPDATE private_document_notes SET data=%s,revision=revision+1,updated_at=NOW() WHERE user_id=%s AND document_id=%s',(Jsonb(payload.data),user_id,doc_id))
