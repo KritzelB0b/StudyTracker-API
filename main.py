@@ -225,6 +225,7 @@ class FolderInput(BaseModel):
 
 class AnnotationInput(BaseModel):
     data: dict[str, Any]
+    revision: int = Field(ge=0)
 
 @app.on_event('startup')
 def init_private_documents():
@@ -246,6 +247,7 @@ def init_private_documents():
             PRIMARY KEY(user_id, document_id))""")
         conn.execute('CREATE INDEX IF NOT EXISTS private_folders_owner_idx ON private_folders(user_id,parent_id)')
         conn.execute('CREATE INDEX IF NOT EXISTS private_documents_owner_idx ON private_documents(user_id,folder_id)')
+        conn.execute('ALTER TABLE private_document_notes ADD COLUMN IF NOT EXISTS revision BIGINT NOT NULL DEFAULT 0')
 
 def checked_uuid(value: str | None):
     if value is None: return None
@@ -350,8 +352,8 @@ def private_document_notes(doc_id:str,user_id:int=Depends(auth)):
     with connect() as conn:
         found=conn.execute('SELECT 1 FROM private_documents WHERE id=%s AND user_id=%s',(doc_id,user_id)).fetchone()
         if not found:raise HTTPException(404,'Datei nicht gefunden')
-        row=conn.execute('SELECT data FROM private_document_notes WHERE document_id=%s AND user_id=%s',(doc_id,user_id)).fetchone()
-    return {'data':row[0] if row else {'pages':{}}}
+        row=conn.execute('SELECT data, revision FROM private_document_notes WHERE document_id=%s AND user_id=%s',(doc_id,user_id)).fetchone()
+    return {'data':row[0] if row else {'pages':{}}, 'revision':row[1] if row else 0}
 
 @app.put('/private/documents/{doc_id}/notes')
 def save_private_document_notes(doc_id:str,payload:AnnotationInput,user_id:int=Depends(auth)):
@@ -360,6 +362,12 @@ def save_private_document_notes(doc_id:str,payload:AnnotationInput,user_id:int=D
     with connect() as conn:
         found=conn.execute('SELECT 1 FROM private_documents WHERE id=%s AND user_id=%s',(doc_id,user_id)).fetchone()
         if not found:raise HTTPException(404,'Datei nicht gefunden')
-        conn.execute("""INSERT INTO private_document_notes(user_id,document_id,data) VALUES(%s,%s,%s)
-          ON CONFLICT(user_id,document_id) DO UPDATE SET data=EXCLUDED.data,updated_at=NOW()""",(user_id,doc_id,Jsonb(payload.data)))
-    return {'saved':True}
+        row=conn.execute('SELECT revision FROM private_document_notes WHERE user_id=%s AND document_id=%s FOR UPDATE',(user_id,doc_id)).fetchone()
+        actual=row[0] if row else 0
+        if actual!=payload.revision:
+            raise HTTPException(409,'Neuere Anmerkungen vorhanden: Bitte Dokument erneut laden')
+        if row:
+            conn.execute('UPDATE private_document_notes SET data=%s,revision=revision+1,updated_at=NOW() WHERE user_id=%s AND document_id=%s',(Jsonb(payload.data),user_id,doc_id))
+        else:
+            conn.execute('INSERT INTO private_document_notes(user_id,document_id,data,revision) VALUES(%s,%s,%s,1)',(user_id,doc_id,Jsonb(payload.data)))
+    return {'saved':True,'revision':actual+1}
