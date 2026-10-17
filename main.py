@@ -1,5 +1,6 @@
 import os
 import secrets
+import hashlib
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -41,14 +42,21 @@ def init_db():
 
 def login_token(user_id: int):
     now = datetime.now(timezone.utc)
-    return jwt.encode({'sub': str(user_id), 'iat': now, 'exp': now + timedelta(days=7)}, JWT_SECRET, algorithm='HS256')
+    return jwt.encode({'sub': str(user_id), 'iat': now, 'exp': now + timedelta(hours=24)}, JWT_SECRET, algorithm='HS256')
 
 def auth(authorization: str | None = Header(default=None)) -> int:
     if not authorization or not authorization.startswith('Bearer '):
         raise HTTPException(401, 'Anmeldung erforderlich')
     try:
-        claims = jwt.decode(authorization.split(' ',1)[1], JWT_SECRET, algorithms=['HS256'])
-        return int(claims['sub'])
+        token = authorization.split(' ', 1)[1]
+        claims = jwt.decode(token, JWT_SECRET, algorithms=['HS256'])
+        user_id = int(claims['sub'])
+        token_hash = hashlib.sha256(token.encode('utf-8')).hexdigest()
+        with connect() as conn:
+            revoked = conn.execute('SELECT 1 FROM revoked_auth_tokens WHERE token_hash=%s AND expires_at > NOW()', (token_hash,)).fetchone()
+        if revoked:
+            raise HTTPException(401, 'Sitzung wurde abgemeldet')
+        return user_id
     except (jwt.PyJWTError, ValueError, KeyError):
         raise HTTPException(401, 'Sitzung abgelaufen oder ungültig')
 
@@ -71,13 +79,71 @@ def register(payload: Credentials):
         conn.execute('INSERT INTO user_data (user_id) VALUES (%s)', (user_id,))
     return {'token':login_token(user_id)}
 
+# Brute-force protection for the single authorized account.
+# Keep a transactional row lock so concurrent attempts cannot bypass the limit.
+AUTH_LIMIT = 5
+AUTH_WINDOW = timedelta(minutes=15)
+
+@app.on_event('startup')
+def init_auth_security():
+    with connect() as conn:
+        conn.execute("""CREATE TABLE IF NOT EXISTS auth_login_limits (
+            login_hash TEXT PRIMARY KEY,
+            failed_attempts INTEGER NOT NULL DEFAULT 0,
+            window_started TIMESTAMPTZ NOT NULL DEFAULT NOW()
+        )""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS revoked_auth_tokens (
+            token_hash TEXT PRIMARY KEY,
+            expires_at TIMESTAMPTZ NOT NULL
+        )""")
+
 @app.post('/auth/login')
 def login(payload: Credentials):
-    with connect() as conn:
-        row = conn.execute('SELECT id, password_hash FROM users WHERE email=%s', (payload.email.lower(),)).fetchone()
-    if not row or not hasher.verify(payload.password, row[1]):
+    email = payload.email.lower().strip()
+    # This application has one account. Do not create limiter rows for arbitrary emails.
+    if email != OWNER_EMAIL:
         raise HTTPException(401, 'E-Mail oder Passwort falsch')
-    return {'token':login_token(row[0])}
+    login_hash = hashlib.sha256((JWT_SECRET + ':' + email).encode('utf-8')).hexdigest()
+    denied = False
+    authenticated_id = None
+    with connect() as conn:
+        conn.execute('INSERT INTO auth_login_limits(login_hash) VALUES(%s) ON CONFLICT DO NOTHING', (login_hash,))
+        attempts, started = conn.execute(
+            'SELECT failed_attempts,window_started FROM auth_login_limits WHERE login_hash=%s FOR UPDATE',
+            (login_hash,)
+        ).fetchone()
+        now = datetime.now(timezone.utc)
+        if now - started >= AUTH_WINDOW:
+            attempts = 0
+            conn.execute('UPDATE auth_login_limits SET failed_attempts=0,window_started=%s WHERE login_hash=%s', (now, login_hash))
+        if attempts >= AUTH_LIMIT:
+            denied = True
+        else:
+            row = conn.execute('SELECT id,password_hash FROM users WHERE email=%s', (email,)).fetchone()
+            if row and hasher.verify(payload.password, row[1]):
+                authenticated_id = row[0]
+                conn.execute('DELETE FROM auth_login_limits WHERE login_hash=%s', (login_hash,))
+                conn.execute('DELETE FROM revoked_auth_tokens WHERE expires_at <= NOW()')
+            else:
+                conn.execute('UPDATE auth_login_limits SET failed_attempts=failed_attempts+1 WHERE login_hash=%s', (login_hash,))
+    if denied:
+        raise HTTPException(429, 'Zu viele Anmeldeversuche. Bitte in 15 Minuten erneut versuchen.', headers={'Retry-After':'900'})
+    if authenticated_id is None:
+        raise HTTPException(401, 'E-Mail oder Passwort falsch')
+    return {'token':login_token(authenticated_id)}
+
+@app.post('/auth/logout')
+def logout(authorization: str | None = Header(default=None), user_id: int = Depends(auth)):
+    token = authorization.split(' ', 1)[1]
+    claims = jwt.decode(token, JWT_SECRET, algorithms=['HS256'])
+    digest = hashlib.sha256(token.encode('utf-8')).hexdigest()
+    expiry = datetime.fromtimestamp(int(claims['exp']), tz=timezone.utc)
+    with connect() as conn:
+        conn.execute(
+            'INSERT INTO revoked_auth_tokens(token_hash,expires_at) VALUES(%s,%s) ON CONFLICT (token_hash) DO NOTHING',
+            (digest, expiry)
+        )
+    return {'logged_out':True}
 
 @app.get('/sync')
 def pull(user_id: int = Depends(auth)):
@@ -154,7 +220,7 @@ def public_view():
     allowed_ids={m.get('id') for m in mods if isinstance(m,dict)}
     # Semester workload is stored in study.modules, not in the editable module list.
     # Publish only the numeric handbook totals and public module labels.
-    if 'cockpit' in fields or 'calendar' in fields:
+    if 'cockpit' in fields and 'modules' in fields:
         handbook = study.get('modules', []) or []
         if not isinstance(handbook, list):
             handbook = []
@@ -179,9 +245,11 @@ def public_view():
         usable=[e for e in entries if isinstance(e,dict)]
         total=sum(safe_minutes(e.get('minutes')) for e in usable)
         r['summary']={'hours':round(total/60,1),'sessions':len(usable)}
-        r['by_module']=[{'moduleId':str(m.get('id',''))[:60],'name':str(m.get('name','Modul'))[:120],
-                         'hours':round(sum(safe_minutes(e.get('minutes')) for e in usable if e.get('moduleId')==m.get('id'))/60,1)}
-                       for m in mods if isinstance(m,dict)][:100]
+        # Learning totals do not implicitly disclose module titles. They require the modules permission.
+        if 'modules' in fields:
+            r['by_module']=[{'moduleId':str(m.get('id',''))[:60],'name':str(m.get('name','Modul'))[:120],
+                             'hours':round(sum(safe_minutes(e.get('minutes')) for e in usable if e.get('moduleId')==m.get('id'))/60,1)}
+                           for m in mods if isinstance(m,dict)][:100]
         r['by_day']=[{'date':d,'hours':round(sum(safe_minutes(e.get('minutes')) for e in usable if e.get('date')==d)/60,1)}
                      for d in sorted(set(e.get('date') for e in usable if clean_date(e.get('date'))))][-120:]
     if 'calendar' in fields:
