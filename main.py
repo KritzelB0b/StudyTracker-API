@@ -11,6 +11,7 @@ from fastapi import FastAPI, HTTPException, Depends, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr, Field
 from pwdlib import PasswordHash
+from ical_subscription import fetch_calendar, parse_calendar, normalize_url
 
 DATABASE_URL = os.environ.get('DATABASE_URL', '')
 JWT_SECRET = os.environ.get('JWT_SECRET', '')
@@ -144,6 +145,29 @@ def logout(authorization: str | None = Header(default=None), user_id: int = Depe
             (digest, expiry)
         )
     return {'logged_out':True}
+
+
+class CalendarFeed(BaseModel):
+    url: str = Field(min_length=10, max_length=2048)
+
+
+@app.post('/calendar/ical')
+def read_calendar_feed(payload: CalendarFeed, user_id: int = Depends(auth)):
+    """Read a single private feed on demand; do not store the subscription URL server-side."""
+    try:
+        url = normalize_url(payload.url)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from None
+    try:
+        content = fetch_calendar(url)
+    except ValueError as exc:
+        raise HTTPException(502, str(exc)) from None
+    try:
+        entries = parse_calendar(content)
+    except (ValueError, OverflowError) as exc:
+        raise HTTPException(422, 'Kalenderformat nicht vollständig lesbar: ' + str(exc)) from None
+    return {'events': entries, 'count': len(entries)}
+
 
 @app.get('/sync')
 def pull(user_id: int = Depends(auth)):
