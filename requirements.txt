@@ -6,3 +6,4 @@ PyJWT>=2.9,<3
 pydantic[email]>=2.9,<3
 boto3>=1.35,<2
 python-dateutil>=2.9,<3
+tzdata>=2025.1,<2030
