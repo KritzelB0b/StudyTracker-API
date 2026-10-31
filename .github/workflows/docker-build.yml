@@ -14,5 +14,6 @@ jobs:
         run: |
           docker run --rm studytracker-api:ci python -m pip check
           docker run --rm studytracker-api:ci python -m compileall -q main.py ical_subscription.py
+          docker run --rm studytracker-api:ci python -c 'from zoneinfo import ZoneInfo; assert ZoneInfo("Europe/Berlin")'
       - name: Report resulting image size
         run: docker image inspect studytracker-api:ci --format 'Image size in bytes: {{.Size}}'
